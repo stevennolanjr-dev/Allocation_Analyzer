@@ -1,0 +1,25 @@
+{
+  "units": [
+    { "id": "KC-A-1", "component": "A", "mds": "KC-135", "wing": "92 ARW", "squadron": "384 ARS", "base": "Fairchild", "associateType": null, "theater": null, "crews": 12 },
+    { "id": "KC-A-2", "component": "A", "mds": "KC-135", "wing": "6 AMW", "squadron": "50 ARS", "base": "MacDill", "associateType": null, "theater": null, "crews": 10 },
+    { "id": "KC-A-3", "component": "A", "mds": "KC-46", "wing": "60 AMW", "squadron": "9 ARS", "base": "Travis", "associateType": null, "theater": null, "crews": 12 },
+    { "id": "KC-A-4", "component": "A", "mds": "KC-135", "wing": "92 ARW", "squadron": "92 ARS", "base": "Fairchild", "associateType": null, "theater": null, "crews": 12 },
+    { "id": "KC-A-5", "component": "A", "mds": "KC-135", "wing": "22 ARW", "squadron": "350 ARS", "base": "McConnell", "associateType": null, "theater": null, "crews": 12 }
+  ],
+  "wingInventory": {
+    "92 ARW": { "tai": 28, "bai": 4, "depot": 2, "mds": "KC-135" },
+    "6 AMW": { "tai": 16, "bai": 2, "depot": 1, "mds": "KC-135" },
+    "60 AMW": { "tai": 24, "bai": 3, "depot": 2, "mds": "KC-46" },
+    "22 ARW": { "tai": 36, "bai": 4, "depot": 3, "mds": "KC-46" },
+    "437 AMW": { "tai": 48, "bai": 6, "depot": 4, "mds": "C-17" }
+  },
+  "commitments": [
+    { "id": "c1", "unitId": "KC-A-1", "isConversion": false, "notes": "", "allocations": [{ "type": "GFMAP", "location": "CENTCOM", "package": "4L", "customTails": null, "customCrews": null }], "startDate": "2027-01-01", "endDate": "2027-06-30", "originalStartDate": null, "originalEndDate": null },
+    { "id": "c2", "unitId": "KC-A-3", "isConversion": false, "notes": "", "allocations": [{ "type": "GFMAP", "location": "INDOPACOM", "package": "4L", "customTails": null, "customCrews": null }], "startDate": "2027-03-01", "endDate": "2027-08-31", "originalStartDate": null, "originalEndDate": null }
+  ],
+  "tdgEntries": [
+    { "id": "tdg-1", "ccmd": "CENTCOM", "period": "27.1a", "type": "GFMAP", "startDate": "2026-10-01", "endDate": "2027-03-31", "pkg4L": 2, "pkg4F": 0, "pkg2F": 0, "addTails": 0, "base": "Al Udeid AB", "icao": "OTBH", "notes": "Standard rotation" },
+    { "id": "tdg-2", "ccmd": "INDOPACOM", "period": "27.1a", "type": "GFMAP", "startDate": "2026-10-01", "endDate": "2027-03-31", "pkg4L": 1, "pkg4F": 1, "pkg2F": 0, "addTails": 0, "base": "Kadena AB", "icao": "RODN", "notes": "" }
+  ],
+  "lastUpdated": "2025-01-16T00:00:00Z"
+}

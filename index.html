@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mobility Force Allocation Tool</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace; }
+    #root { min-height: 100vh; }
+    .loading { display: flex; align-items: center; justify-content: center; min-height: 100vh; background: #0a0f1a; color: #64748b; }
+  </style>
+</head>
+<body>
+  <div id="root"><div class="loading">Loading...</div></div>
+  
+  <script type="text/babel" data-type="module">
+    const { useState, useRef, useCallback, useMemo, useEffect } = React;
+
+    // ============ CONFIGURATION ============
+    const READ_ONLY = false;  // Set to true for viewer version
+    const DATA_URL = './mobility-data.json';  // Path to your JSON file
+    const STORAGE_KEY = 'mobility-allocation-data';
+    
+    // ============ CONSTANTS ============
+    const MONTH_WIDTH = 36;
+    const ROW_HEIGHT = 28;
+    const LABEL_WIDTH = 320;
+    const START_DATE = new Date(2023, 9, 1);
+    const END_DATE = new Date(2030, 8, 30);
+
+    const formatDate = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const parseDate = (dateStr) => { const [y, m, d] = dateStr.split('-').map(Number); return new Date(y, m - 1, d); };
+    const addMonths = (date, months) => { const d = new Date(date); d.setMonth(d.getMonth() + months); return d; };
+    const addDays = (date, days) => { const d = new Date(date); d.setDate(d.getDate() + days); return d; };
+    const daysBetween = (d1, d2) => Math.round((parseDate(d2) - parseDate(d1)) / (1000 * 60 * 60 * 24));
+    const datesOverlap = (s1, e1, s2, e2) => s1 <= e2 && e1 >= s2;
+
+    const MONTHS = [];
+    let d = new Date(START_DATE);
+    while (d <= END_DATE) {
+      const fiscalYear = d.getMonth() >= 9 ? d.getFullYear() + 1 : d.getFullYear();
+      MONTHS.push({ key: `${d.getFullYear()}-${d.getMonth()}`, year: d.getFullYear(), month: d.getMonth() + 1, label: d.toLocaleString('default', { month: 'short' }), fiscalYear, isFYStart: d.getMonth() === 9 });
+      d = addMonths(d, 1);
+    }
+
+    const componentColors = { A: '#3b82f6', R: '#10b981', G: '#f59e0b' };
+    const mdsColors = { 'KC-135': '#6366f1', 'KC-46': '#8b5cf6', 'C-17': '#06b6d4', 'C-130J': '#22c55e', 'C-130H': '#84cc16', 'C-5M': '#a855f7' };
+    const ccmdColors = { TRANSCOM: '#6366f1', CENTCOM: '#ef4444', INDOPACOM: '#f59e0b', EUCOM: '#3b82f6', AFRICOM: '#10b981', NORTHCOM: '#06b6d4', SOUTHCOM: '#ec4899' };
+    const ccmdAbbrev = { TRANSCOM: 'TC', CENTCOM: 'CC', INDOPACOM: 'IPC', EUCOM: 'EC', AFRICOM: 'AC', NORTHCOM: 'NC', SOUTHCOM: 'SC' };
+    const mdsOptions = ['KC-135', 'KC-46', 'C-5M', 'C-17', 'C-130J', 'C-130H'];
+    const packageTypes = { '4L': { tails: 4, crews: 8 }, '4F': { tails: 4, crews: 12 }, '2F': { tails: 2, crews: 6 }, '8S': { tails: 8, crews: 16 } };
+    const commitmentTypes = { GFMAP: { color: '#3b82f6' }, RFF: { color: '#f59e0b' }, RFS: { color: '#8b5cf6' }, EX: { color: '#06b6d4' }, OTH: { color: '#64748b' } };
+    const afforgenPhases = [
+      { id: 'reset', label: 'R', fullLabel: 'Reset', color: '#ef4444' },
+      { id: 'prepare', label: 'P', fullLabel: 'Prepare', color: '#f59e0b' },
+      { id: 'certify', label: 'C', fullLabel: 'Certify', color: '#3b82f6' },
+      { id: 'available', label: 'A', fullLabel: 'Available', color: '#22c55e' }
+    ];
+
+    // Default data (used if no JSON loaded)
+    const defaultUnits = [];
+    const defaultCommitments = [];
+    const defaultTDG = [];
+    const defaultWingInventory = {};
+
+    const getAllocationTailsCrews = (alloc) => {
+      if (alloc.customTails !== null) return { tails: alloc.customTails, crews: alloc.customCrews ?? alloc.customTails * 2 };
+      const pkg = packageTypes[alloc.package];
+      return pkg ? { tails: pkg.tails, crews: alloc.customCrews ?? pkg.crews } : { tails: 0, crews: 0 };
+    };
+
+    const getAllocationTotals = (allocations) => {
+      let tails = 0, crews = 0;
+      allocations.forEach(a => { const tc = getAllocationTailsCrews(a); tails += tc.tails; crews += tc.crews; });
+      return { tails, crews };
+    };
+
+    const calcTdgTotals = (tdg) => {
+      let tails = 0, crews = 0;
+      if (tdg.pkg4L) { tails += tdg.pkg4L * 4; crews += tdg.pkg4L * 8; }
+      if (tdg.pkg4F) { tails += tdg.pkg4F * 4; crews += tdg.pkg4F * 12; }
+      if (tdg.pkg2F) { tails += tdg.pkg2F * 2; crews += tdg.pkg2F * 6; }
+      if (tdg.addTails) { tails += tdg.addTails; crews += tdg.addTails * 2; }
+      return { tails, crews };
+    };
+
+    function MobilityAllocationTool({ initialData }) {
+      const loadInitialState = (key, fallback) => {
+        if (READ_ONLY) return initialData?.[key] || fallback;
+        try {
+          const saved = localStorage.getItem(STORAGE_KEY);
+          if (saved) {
+            const parsed = JSON.parse(saved);
+            if (parsed[key]) return parsed[key];
+          }
+        } catch (e) { console.warn('Failed to load from localStorage:', e); }
+        return initialData?.[key] || fallback;
+      };
+
+      const [units, setUnits] = useState(() => loadInitialState('units', defaultUnits));
+      const [commitments, setCommitments] = useState(() => loadInitialState('commitments', defaultCommitments));
+      const [tdgEntries, setTdgEntries] = useState(() => loadInitialState('tdgEntries', defaultTDG));
+      const [wingInventory, setWingInventory] = useState(() => loadInitialState('wingInventory', defaultWingInventory));
+      const [afforgenOverrides, setAfforgenOverrides] = useState(() => loadInitialState('afforgenOverrides', {}));
+      
+      const [filters, setFilters] = useState({ component: 'all', mds: [], search: '', ccmd: 'all' });
+      const [dateRange, setDateRange] = useState({ start: '', end: '' });
+      const [sortConfig, setSortConfig] = useState({ field: 'squadron', direction: 'asc', groupByComponent: true, groupByMDS: true });
+      const [selectedCommitment, setSelectedCommitment] = useState(null);
+      const [editMode, setEditMode] = useState(false);
+      const [showSettings, setShowSettings] = useState(false);
+      const [showTDG, setShowTDG] = useState(true);
+      const [showTheaterAssets, setShowTheaterAssets] = useState(false);
+      const [showDwellLines, setShowDwellLines] = useState(true);
+      const [showChanges, setShowChanges] = useState(true);
+      const [hoveredCommitment, setHoveredCommitment] = useState(null);
+      const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
+      const [detailLevel, setDetailLevel] = useState('medium');
+      const [afforgenSettings, setAfforgenSettings] = useState({ phaseDuration: 6, displayMode: 'available' });
+      const [lastSaved, setLastSaved] = useState(null);
+      const [addPrompt, setAddPrompt] = useState(null);
+      const [tdgModal, setTdgModal] = useState(null);
+      const [inventoryModal, setInventoryModal] = useState(null);
+      const [crewModal, setCrewModal] = useState(null);
+      const [dragState, setDragState] = useState(null);
+      
+      const scrollContainerRef = useRef(null);
+      const fileInputRef = useRef(null);
+
+      // Auto-save to localStorage
+      useEffect(() => {
+        if (READ_ONLY) return;
+        const dataToSave = { units, commitments, tdgEntries, wingInventory, afforgenOverrides, savedAt: new Date().toISOString() };
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(dataToSave));
+          setLastSaved(new Date());
+        } catch (e) { console.warn('Failed to save:', e); }
+      }, [units, commitments, tdgEntries, wingInventory, afforgenOverrides]);
+
+      // Export/Import functions
+      const exportData = () => {
+        const data = { units, commitments, tdgEntries, wingInventory, afforgenOverrides, exportedAt: new Date().toISOString() };
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `mobility-data-${formatDate(new Date())}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      };
+
+      const importData = (event) => {
+        const file = event.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          try {
+            const data = JSON.parse(e.target.result);
+            if (data.units) setUnits(data.units);
+            if (data.commitments) setCommitments(data.commitments);
+            if (data.tdgEntries) setTdgEntries(data.tdgEntries);
+            if (data.wingInventory) setWingInventory(data.wingInventory);
+            if (data.afforgenOverrides) setAfforgenOverrides(data.afforgenOverrides);
+            alert('Data imported successfully!');
+          } catch (err) { alert('Failed to import: ' + err.message); }
+        };
+        reader.readAsText(file);
+        event.target.value = '';
+      };
+
+      const resetData = () => {
+        if (!confirm('Reset all data to defaults? This cannot be undone.')) return;
+        setUnits(initialData?.units || defaultUnits);
+        setCommitments(initialData?.commitments || defaultCommitments);
+        setTdgEntries(initialData?.tdgEntries || defaultTDG);
+        setWingInventory(initialData?.wingInventory || defaultWingInventory);
+        setAfforgenOverrides({});
+        localStorage.removeItem(STORAGE_KEY);
+      };
+
+      // Wing/crew helpers
+      const getWingStats = useCallback((wingName) => {
+        const inv = wingInventory[wingName] || { tai: 0, bai: 0, depot: 0, mds: '' };
+        const paa = inv.tai - inv.bai;
+        return { ...inv, paa, possessed: paa - inv.depot };
+      }, [wingInventory]);
+
+      const wingCrewTotals = useMemo(() => {
+        const totals = {};
+        units.forEach(u => {
+          if (u.theater) return;
+          if (!totals[u.wing]) totals[u.wing] = { crews: 0, mds: u.mds, squadrons: [] };
+          totals[u.wing].crews += (u.crews || 0);
+          totals[u.wing].squadrons.push({ id: u.id, squadron: u.squadron, crews: u.crews || 0 });
+        });
+        return totals;
+      }, [units]);
+
+      const updateSquadronCrews = (unitId, newCrews) => {
+        setUnits(prev => prev.map(u => u.id === unitId ? { ...u, crews: parseInt(newCrews) || 0 } : u));
+      };
+
+      const updateWingInventory = (wingName, field, value) => {
+        setWingInventory(prev => ({
+          ...prev,
+          [wingName]: { tai: 0, bai: 0, depot: 0, mds: '', ...prev[wingName], [field]: parseInt(value) || 0 }
+        }));
+      };
+
+      // Computed values
+      const visibleMonths = useMemo(() => {
+        if (!dateRange.start && !dateRange.end) return MONTHS;
+        return MONTHS.filter(m => {
+          const monthStart = `${m.year}-${String(m.month).padStart(2, '0')}-01`;
+          const monthEnd = `${m.year}-${String(m.month).padStart(2, '0')}-28`;
+          if (dateRange.start && monthEnd < dateRange.start) return false;
+          if (dateRange.end && monthStart > dateRange.end) return false;
+          return true;
+        });
+      }, [dateRange]);
+
+      const visibleCommitments = useMemo(() => {
+        if (!dateRange.start && !dateRange.end) return commitments;
+        return commitments.filter(c => {
+          if (dateRange.start && c.endDate < dateRange.start) return false;
+          if (dateRange.end && c.startDate > dateRange.end) return false;
+          return true;
+        });
+      }, [commitments, dateRange]);
+
+      const commitmentsByUnit = useMemo(() => {
+        const map = new Map();
+        commitments.forEach(c => {
+          const arr = map.get(c.unitId) || [];
+          arr.push(c);
+          map.set(c.unitId, arr);
+        });
+        return map;
+      }, [commitments]);
+
+      const visibleCommitmentsByUnit = useMemo(() => {
+        const map = new Map();
+        visibleCommitments.forEach(c => {
+          const arr = map.get(c.unitId) || [];
+          arr.push(c);
+          map.set(c.unitId, arr);
+        });
+        return map;
+      }, [visibleCommitments]);
+
+      const unitCounts = useMemo(() => {
+        const counts = { total: units.filter(u => !u.theater).length, theater: units.filter(u => u.theater).length };
+        mdsOptions.forEach(m => { counts[m] = units.filter(u => u.mds === m && !u.theater).length; });
+        return counts;
+      }, [units]);
+
+      const tdgStatus = useMemo(() => {
+        const status = {};
+        tdgEntries.forEach(tdg => {
+          let allocatedTails = 0, allocatedCrews = 0;
+          commitments.forEach(c => {
+            if (c.isConversion) return;
+            if (!datesOverlap(c.startDate, c.endDate, tdg.startDate, tdg.endDate)) return;
+            c.allocations.forEach(a => {
+              if (a.location === tdg.ccmd) {
+                const tc = getAllocationTailsCrews(a);
+                allocatedTails += tc.tails;
+                allocatedCrews += tc.crews;
+              }
+            });
+          });
+          const required = calcTdgTotals(tdg);
+          const delta = allocatedTails - required.tails;
+          status[tdg.id] = { ...tdg, required, allocated: { tails: allocatedTails, crews: allocatedCrews }, delta, state: delta < 0 ? 'under' : delta > 2 ? 'over' : 'met' };
+        });
+        return status;
+      }, [tdgEntries, commitments]);
+
+      const ccmdDemand = useMemo(() => {
+        const demand = {};
+        Object.keys(ccmdColors).forEach(ccmd => { demand[ccmd] = { tails: 0, crews: 0, hasTDG: false, issues: 0 }; });
+        commitments.forEach(c => { 
+          if (c.isConversion) return; 
+          c.allocations.forEach(a => { 
+            if (a.location && demand[a.location]) { 
+              const tc = getAllocationTailsCrews(a); 
+              demand[a.location].tails += tc.tails; 
+              demand[a.location].crews += tc.crews; 
+            } 
+          }); 
+        });
+        Object.values(tdgStatus).forEach(ts => { 
+          if (demand[ts.ccmd]) { 
+            demand[ts.ccmd].hasTDG = true; 
+            if (ts.state !== 'met') demand[ts.ccmd].issues++; 
+          } 
+        });
+        return demand;
+      }, [commitments, tdgStatus]);
+
+      const filteredAndSortedUnits = useMemo(() => {
+        let filtered = units.filter(unit => {
+          if (!showTheaterAssets && unit.theater) return false;
+          if (filters.component !== 'all' && unit.component !== filters.component) return false;
+          if (filters.mds.length > 0 && !filters.mds.includes(unit.mds)) return false;
+          if (filters.search && ![unit.squadron, unit.wing, unit.base].join(' ').toLowerCase().includes(filters.search.toLowerCase())) return false;
+          if (filters.ccmd !== 'all' && !unit.theater && !(commitmentsByUnit.get(unit.id) || []).some(c => c.allocations.some(a => a.location === filters.ccmd))) return false;
+          return true;
+        });
+        
+        filtered.sort((a, b) => {
+          if (a.theater && !b.theater) return 1;
+          if (!a.theater && b.theater) return -1;
+          if (sortConfig.groupByMDS && a.mds !== b.mds) return mdsOptions.indexOf(a.mds) - mdsOptions.indexOf(b.mds);
+          if (sortConfig.groupByComponent && a.component !== b.component) return a.component.localeCompare(b.component);
+          const dir = sortConfig.direction === 'asc' ? 1 : -1;
+          return (a[sortConfig.field] || '').localeCompare(b[sortConfig.field] || '') * dir;
+        });
+        return filtered;
+      }, [units, filters, sortConfig, showTheaterAssets, commitmentsByUnit]);
+
+      // Positioning
+      const dateToPixel = (dateStr) => {
+        const date = parseDate(dateStr);
+        const startMonth = (START_DATE.getFullYear() * 12 + START_DATE.getMonth());
+        const dateMonth = (date.getFullYear() * 12 + date.getMonth());
+        const monthIndex = dateMonth - startMonth;
+        const dayFraction = (date.getDate() - 1) / 28;
+        return monthIndex * MONTH_WIDTH + dayFraction * MONTH_WIDTH;
+      };
+
+      const getCommitmentStyle = (commitment, isGhost = false) => {
+        const startPx = dateToPixel(commitment.startDate);
+        const endPx = dateToPixel(commitment.endDate);
+        if (startPx === null || endPx === null) return null;
+        const mainColor = commitment.isConversion ? '#fecaca' : (ccmdColors[commitment.allocations[0]?.location] || '#475569');
+        return {
+          left: `${startPx}px`,
+          width: `${Math.max(endPx - startPx + MONTH_WIDTH * 0.9, 8)}px`,
+          backgroundColor: isGhost ? 'transparent' : mainColor,
+          border: isGhost ? `2px dashed ${mainColor}40` : 'none',
+          opacity: isGhost ? 0.4 : 1
+        };
+      };
+
+      const getBlockLabel = (c, width) => {
+        if (c.isConversion) return '⟳';
+        const allocs = c.allocations;
+        if (allocs.length === 1) {
+          const a = allocs[0];
+          const abbr = ccmdAbbrev[a.location] || a.location;
+          if (width < 50) return abbr;
+          if (width < 80) return `${a.package || ''} ${abbr}`.trim();
+          return `${a.type} ${a.package || ''} ${abbr}`.trim();
+        }
+        const totalTails = getAllocationTotals(allocs).tails;
+        const locs = [...new Set(allocs.map(a => ccmdAbbrev[a.location]))].join('/');
+        return `${totalTails}T • ${locs}`;
+      };
+
+      const toggleSort = (field) => {
+        setSortConfig(s => ({
+          ...s,
+          field,
+          direction: s.field === field && s.direction === 'asc' ? 'desc' : 'asc'
+        }));
+      };
+
+      const handleMouseEnter = (e, c) => {
+        setHoveredCommitment(c);
+        setTooltipPos({ x: e.clientX + 10, y: e.clientY + 10 });
+      };
+
+      // Commitment editing
+      const updateCommitment = (id, updates) => {
+        setCommitments(prev => prev.map(c => c.id === id ? { ...c, ...updates } : c));
+        if (selectedCommitment?.id === id) setSelectedCommitment(c => ({ ...c, ...updates }));
+      };
+
+      const deleteCommitment = (id) => {
+        if (!confirm('Delete this commitment?')) return;
+        setCommitments(prev => prev.filter(c => c.id !== id));
+        setSelectedCommitment(null);
+      };
+
+      const addAllocation = () => {
+        const newAlloc = { type: 'GFMAP', location: 'CENTCOM', package: '4L', customTails: null, customCrews: null };
+        updateCommitment(selectedCommitment.id, { allocations: [...selectedCommitment.allocations, newAlloc] });
+      };
+
+      const updateAllocation = (idx, field, value) => {
+        const newAllocs = [...selectedCommitment.allocations];
+        if (field === 'customTails') {
+          newAllocs[idx] = { ...newAllocs[idx], customTails: value === '' ? null : parseInt(value), package: value === '' ? newAllocs[idx].package : null };
+        } else if (field === 'customCrews') {
+          newAllocs[idx] = { ...newAllocs[idx], customCrews: value === '' ? null : parseInt(value) };
+        } else {
+          newAllocs[idx] = { ...newAllocs[idx], [field]: value };
+        }
+        updateCommitment(selectedCommitment.id, { allocations: newAllocs });
+      };
+
+      const removeAllocation = (idx) => {
+        updateCommitment(selectedCommitment.id, { allocations: selectedCommitment.allocations.filter((_, i) => i !== idx) });
+      };
+
+      const handleConversionToggle = (checked) => {
+        updateCommitment(selectedCommitment.id, { 
+          isConversion: checked, 
+          allocations: checked ? [] : [{ type: 'GFMAP', location: 'CENTCOM', package: '4L', customTails: null, customCrews: null }]
+        });
+      };
+
+      const handleTimelineClick = (e, unit) => {
+        if (!editMode || READ_ONLY || unit.theater) return;
+        const rect = e.currentTarget.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const monthIdx = Math.floor(x / MONTH_WIDTH);
+        if (monthIdx >= 0 && monthIdx < MONTHS.length) {
+          const m = MONTHS[monthIdx];
+          const startDate = `${m.year}-${String(m.month).padStart(2, '0')}-01`;
+          const endDate = formatDate(addMonths(parseDate(startDate), 6));
+          const newCommitment = {
+            id: `c-${Date.now()}`,
+            unitId: unit.id,
+            isConversion: false,
+            notes: '',
+            allocations: [{ type: 'GFMAP', location: 'CENTCOM', package: '4L', customTails: null, customCrews: null }],
+            startDate,
+            endDate,
+            originalStartDate: null,
+            originalEndDate: null
+          };
+          setCommitments(prev => [...prev, newCommitment]);
+          setSelectedCommitment(newCommitment);
+        }
+      };
+
+      // Drag handling
+      const handleDragStart = (e, commitment, unit) => {
+        if (!editMode || READ_ONLY) return;
+        e.preventDefault();
+        setDragState({ commitmentId: commitment.id, unitId: unit.id, startX: e.clientX, originalStart: commitment.startDate, originalEnd: commitment.endDate });
+      };
+
+      useEffect(() => {
+        if (!dragState) return;
+        const handleMove = (e) => {
+          const dx = e.clientX - dragState.startX;
+          const daysDelta = Math.round(dx / (MONTH_WIDTH / 30));
+          const newStart = formatDate(addDays(parseDate(dragState.originalStart), daysDelta));
+          const newEnd = formatDate(addDays(parseDate(dragState.originalEnd), daysDelta));
+          updateCommitment(dragState.commitmentId, { startDate: newStart, endDate: newEnd });
+        };
+        const handleUp = () => setDragState(null);
+        window.addEventListener('mousemove', handleMove);
+        window.addEventListener('mouseup', handleUp);
+        return () => { window.removeEventListener('mousemove', handleMove); window.removeEventListener('mouseup', handleUp); };
+      }, [dragState]);
+
+      return (
+        <div style={{ minHeight: '100vh', backgroundColor: '#0a0f1a', color: '#e2e8f0', fontFamily: "'JetBrains Mono', 'SF Mono', monospace", fontSize: '12px', userSelect: dragState ? 'none' : 'auto' }}>
+          <input type="file" ref={fileInputRef} onChange={importData} accept=".json" style={{ display: 'none' }} />
+          
+          {/* Header */}
+          <div style={{ padding: '12px 20px', borderBottom: '1px solid #1e293b', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'linear-gradient(180deg, #0f172a 0%, #0a0f1a 100%)' }}>
+            <div>
+              <h1 style={{ margin: 0, fontSize: '16px', fontWeight: 600, letterSpacing: '0.05em', color: '#f8fafc' }}>
+                MOBILITY FORCE ALLOCATION {READ_ONLY && <span style={{ fontSize: '10px', color: '#64748b', fontWeight: 400 }}>(VIEW ONLY)</span>}
+              </h1>
+              <p style={{ margin: '2px 0 0 0', color: '#64748b', fontSize: '10px' }}>
+                AMC A38 • FY24-FY30 • {unitCounts.total} units{showTheaterAssets && ` + ${unitCounts.theater} Theater`}
+                {lastSaved && !READ_ONLY && ` • Saved ${lastSaved.toLocaleTimeString()}`}
+              </p>
+            </div>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              {!READ_ONLY && (
+                <>
+                  <button onClick={() => fileInputRef.current?.click()} style={{ padding: '6px 10px', backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '4px', color: '#94a3b8', cursor: 'pointer', fontSize: '10px' }} title="Import JSON">📥</button>
+                  <button onClick={exportData} style={{ padding: '6px 10px', backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '4px', color: '#94a3b8', cursor: 'pointer', fontSize: '10px' }} title="Export JSON">📤</button>
+                  <button onClick={resetData} style={{ padding: '6px 10px', backgroundColor: '#1e293b', border: '1px solid #7f1d1d', borderRadius: '4px', color: '#f87171', cursor: 'pointer', fontSize: '10px' }} title="Reset">⟲</button>
+                </>
+              )}
+              <button onClick={() => setShowSettings(!showSettings)} style={{ padding: '6px 10px', backgroundColor: showSettings ? '#1e3a5f' : '#1e293b', border: '1px solid #334155', borderRadius: '4px', color: '#f8fafc', cursor: 'pointer', fontSize: '10px' }}>⚙</button>
+              {!READ_ONLY && <button onClick={() => setEditMode(!editMode)} style={{ padding: '6px 12px', backgroundColor: editMode ? '#1d4ed8' : '#1e293b', border: editMode ? '1px solid #3b82f6' : '1px solid #334155', borderRadius: '4px', color: '#f8fafc', cursor: 'pointer', fontSize: '10px', fontWeight: 500 }}>{editMode ? '✓ EDIT' : 'VIEW'}</button>}
+            </div>
+          </div>
+
+          {/* Settings */}
+          {showSettings && (
+            <div style={{ padding: '10px 20px', borderBottom: '1px solid #1e293b', backgroundColor: '#0f172a', display: 'flex', gap: '16px', alignItems: 'center', flexWrap: 'wrap' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}><input type="checkbox" checked={showDwellLines} onChange={e => setShowDwellLines(e.target.checked)} style={{ accentColor: '#3b82f6' }} /><span style={{ color: '#94a3b8', fontSize: '10px' }}>Dwell</span></label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}><input type="checkbox" checked={showChanges} onChange={e => setShowChanges(e.target.checked)} style={{ accentColor: '#3b82f6' }} /><span style={{ color: '#94a3b8', fontSize: '10px' }}>Mods</span></label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}><input type="checkbox" checked={sortConfig.groupByMDS} onChange={e => setSortConfig(s => ({ ...s, groupByMDS: e.target.checked }))} style={{ accentColor: '#3b82f6' }} /><span style={{ color: '#94a3b8', fontSize: '10px' }}>Grp MDS</span></label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}><input type="checkbox" checked={sortConfig.groupByComponent} onChange={e => setSortConfig(s => ({ ...s, groupByComponent: e.target.checked }))} style={{ accentColor: '#3b82f6' }} /><span style={{ color: '#94a3b8', fontSize: '10px' }}>Grp Comp</span></label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}><input type="checkbox" checked={showTDG} onChange={e => setShowTDG(e.target.checked)} style={{ accentColor: '#f59e0b' }} /><span style={{ color: '#94a3b8', fontSize: '10px' }}>TDG</span></label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', borderLeft: '1px solid #334155', paddingLeft: '12px' }}><input type="checkbox" checked={showTheaterAssets} onChange={e => setShowTheaterAssets(e.target.checked)} style={{ accentColor: '#0891b2' }} /><span style={{ color: '#94a3b8', fontSize: '10px' }}>Theater</span></label>
+            </div>
+          )}
+
+          {/* CCMD Demand */}
+          <div style={{ padding: '8px 20px', borderBottom: '1px solid #1e293b', backgroundColor: '#0f172a', display: 'flex', gap: '8px', alignItems: 'center', overflowX: 'auto' }}>
+            <span style={{ color: '#64748b', fontSize: '9px', textTransform: 'uppercase', flexShrink: 0 }}>DEMAND</span>
+            <button onClick={() => setFilters(f => ({ ...f, ccmd: 'all' }))} style={{ padding: '4px 10px', backgroundColor: filters.ccmd === 'all' ? '#334155' : '#1e293b', border: '1px solid #334155', borderRadius: '4px', color: '#f8fafc', cursor: 'pointer', fontSize: '10px' }}>ALL</button>
+            {Object.entries(ccmdDemand).map(([ccmd, data]) => (
+              <button key={ccmd} onClick={() => setFilters(f => ({ ...f, ccmd: filters.ccmd === ccmd ? 'all' : ccmd }))} style={{ padding: '4px 10px', backgroundColor: filters.ccmd === ccmd ? ccmdColors[ccmd] : '#1e293b', border: `1px solid ${ccmdColors[ccmd]}`, borderRadius: '4px', color: '#f8fafc', cursor: 'pointer', fontSize: '10px', display: 'flex', gap: '6px', alignItems: 'center', position: 'relative' }}>
+                <span>{ccmd}</span><span style={{ color: filters.ccmd === ccmd ? '#fff' : '#94a3b8', fontWeight: 600 }}>{data.tails}T/{data.crews}C</span>
+                {showTDG && data.hasTDG && data.issues > 0 && (
+                  <span style={{ position: 'absolute', top: '-4px', right: '-4px', width: '14px', height: '14px', borderRadius: '50%', backgroundColor: '#dc2626', color: '#fff', fontSize: '8px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700 }}>{data.issues}</span>
+                )}
+              </button>
+            ))}
+          </div>
+
+          {/* Filters */}
+          <div style={{ padding: '8px 20px', borderBottom: '1px solid #1e293b', display: 'flex', gap: '12px', alignItems: 'center', backgroundColor: '#0a0f1a', flexWrap: 'wrap' }}>
+            <select value={filters.component} onChange={e => setFilters(f => ({ ...f, component: e.target.value }))} style={{ padding: '4px 8px', backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '4px', color: '#f8fafc', fontSize: '10px' }}>
+              <option value="all">All</option><option value="A">AD</option><option value="R">AFRC</option><option value="G">ANG</option>
+            </select>
+            <div style={{ display: 'flex', gap: '2px', alignItems: 'center' }}>
+              {mdsOptions.map(m => (
+                <button key={m} onClick={() => setFilters(f => ({ ...f, mds: f.mds.includes(m) ? f.mds.filter(x => x !== m) : [...f.mds, m] }))} style={{ padding: '3px 6px', backgroundColor: filters.mds.includes(m) ? mdsColors[m] : '#1e293b', border: `1px solid ${filters.mds.includes(m) ? mdsColors[m] : '#334155'}`, borderRadius: '3px', color: filters.mds.includes(m) ? '#fff' : '#94a3b8', fontSize: '8px', cursor: 'pointer', fontWeight: filters.mds.includes(m) ? 600 : 400 }}>{m === 'C-5M' ? 'C-5' : m}</button>
+              ))}
+              {filters.mds.length > 0 && <button onClick={() => setFilters(f => ({ ...f, mds: [] }))} style={{ padding: '2px 4px', backgroundColor: 'transparent', border: 'none', color: '#64748b', fontSize: '10px', cursor: 'pointer' }}>×</button>}
+            </div>
+            <input type="text" placeholder="Search..." value={filters.search} onChange={e => setFilters(f => ({ ...f, search: e.target.value }))} style={{ padding: '4px 8px', backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '4px', color: '#f8fafc', fontSize: '10px', width: '80px' }} />
+            <span style={{ color: '#334155' }}>|</span>
+            <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+              <span style={{ color: '#64748b', fontSize: '9px' }}>Date:</span>
+              <input type="date" value={dateRange.start} onChange={e => setDateRange(r => ({ ...r, start: e.target.value }))} style={{ padding: '2px 4px', backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '3px', color: '#f8fafc', fontSize: '9px' }} />
+              <span style={{ color: '#64748b' }}>→</span>
+              <input type="date" value={dateRange.end} onChange={e => setDateRange(r => ({ ...r, end: e.target.value }))} style={{ padding: '2px 4px', backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '3px', color: '#f8fafc', fontSize: '9px' }} />
+              {(dateRange.start || dateRange.end) && <button onClick={() => setDateRange({ start: '', end: '' })} style={{ padding: '2px 4px', backgroundColor: 'transparent', border: 'none', color: '#64748b', fontSize: '10px', cursor: 'pointer' }}>×</button>}
+            </div>
+            <span style={{ color: '#334155' }}>|</span>
+            {['wing', 'sqdn', 'base'].map(field => (
+              <button key={field} onClick={() => toggleSort(field === 'sqdn' ? 'squadron' : field)} style={{ padding: '4px 6px', backgroundColor: sortConfig.field === (field === 'sqdn' ? 'squadron' : field) ? '#334155' : '#1e293b', border: '1px solid #334155', borderRadius: '4px', color: sortConfig.field === (field === 'sqdn' ? 'squadron' : field) ? '#f8fafc' : '#94a3b8', cursor: 'pointer', fontSize: '9px' }}>{field}{sortConfig.field === (field === 'sqdn' ? 'squadron' : field) && (sortConfig.direction === 'asc' ? '↑' : '↓')}</button>
+            ))}
+            <span style={{ marginLeft: 'auto', color: '#64748b', fontSize: '10px' }}>{filteredAndSortedUnits.length}</span>
+          </div>
+
+          {/* Legend */}
+          <div style={{ padding: '6px 20px', borderBottom: '1px solid #1e293b', display: 'flex', gap: '8px', alignItems: 'center', backgroundColor: '#0a0f1a', flexWrap: 'wrap', fontSize: '9px' }}>
+            {Object.entries(componentColors).map(([c, col]) => <div key={c} style={{ display: 'flex', alignItems: 'center', gap: '2px' }}><div style={{ width: '5px', height: '5px', backgroundColor: col, borderRadius: '50%' }} /><span style={{ color: '#94a3b8' }}>{c === 'A' ? 'AD' : c}</span></div>)}
+            <span style={{ color: '#334155' }}>|</span>
+            {Object.entries(mdsColors).map(([m, col]) => <div key={m} style={{ display: 'flex', alignItems: 'center', gap: '2px' }}><div style={{ width: '8px', height: '8px', backgroundColor: col, borderRadius: '2px' }} /><span style={{ color: '#94a3b8' }}>{m === 'C-5M' ? 'C-5' : m}</span></div>)}
+            <span style={{ color: '#334155' }}>|</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}><div style={{ width: '12px', height: '7px', backgroundColor: '#3b82f6', borderRadius: '2px' }} /><span style={{ color: '#94a3b8' }}>GFMAP</span></div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}><div style={{ width: '12px', height: '7px', backgroundColor: '#3b82f6', borderRadius: '2px', boxShadow: 'inset 0 0 0 2px #f59e0b' }} /><span style={{ color: '#94a3b8' }}>RFF</span></div>
+          </div>
+
+          <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+            {/* Chart */}
+            <div ref={scrollContainerRef} style={{ flex: 1, overflow: 'auto', maxHeight: 'calc(100vh - 280px)' }}>
+              <div style={{ minWidth: LABEL_WIDTH + MONTHS.length * MONTH_WIDTH }}>
+                {/* Header */}
+                <div style={{ display: 'flex', position: 'sticky', top: 0, zIndex: 20, backgroundColor: '#0f172a' }}>
+                  <div style={{ width: LABEL_WIDTH, minWidth: LABEL_WIDTH, padding: '8px 10px', borderRight: '1px solid #1e293b', borderBottom: '1px solid #1e293b', position: 'sticky', left: 0, backgroundColor: '#0f172a', zIndex: 30 }}>
+                    <span style={{ fontSize: '9px', color: '#64748b' }}>UNIT</span>
+                  </div>
+                  <div style={{ display: 'flex' }}>
+                    {MONTHS.map(month => (
+                      <div key={month.key} style={{ width: MONTH_WIDTH, minWidth: MONTH_WIDTH, padding: '3px 2px', textAlign: 'center', borderRight: month.isFYStart ? '2px solid #475569' : '1px solid #1e293b', borderBottom: '1px solid #1e293b', backgroundColor: month.isFYStart ? '#1e293b' : 'transparent' }}>
+                        {month.isFYStart && <div style={{ fontSize: '8px', color: '#94a3b8', fontWeight: 600 }}>FY{String(month.fiscalYear).slice(2)}</div>}
+                        <div style={{ fontSize: '8px', color: '#64748b' }}>{month.label}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Rows */}
+                {filteredAndSortedUnits.map((unit, idx) => {
+                  const unitCommitments = visibleCommitmentsByUnit.get(unit.id) || [];
+                  const prevUnit = filteredAndSortedUnits[idx - 1];
+                  const showMDSDivider = sortConfig.groupByMDS && prevUnit && !prevUnit.theater && !unit.theater && prevUnit.mds !== unit.mds;
+                  const showComponentDivider = sortConfig.groupByComponent && prevUnit && !prevUnit.theater && !unit.theater && prevUnit.component !== unit.component && (!sortConfig.groupByMDS || prevUnit.mds === unit.mds);
+                  const isTheater = !!unit.theater;
+                  
+                  return (
+                    <React.Fragment key={unit.id}>
+                      {showMDSDivider && <div style={{ padding: '6px 20px', backgroundColor: '#0f172a', borderBottom: '2px solid ' + (mdsColors[unit.mds] || '#475569'), display: 'flex', alignItems: 'center', gap: '8px' }}><div style={{ width: '10px', height: '10px', backgroundColor: mdsColors[unit.mds], borderRadius: '2px' }} /><span style={{ fontSize: '10px', color: mdsColors[unit.mds], fontWeight: 600 }}>{unit.mds === 'C-5M' ? 'C-5' : unit.mds}</span></div>}
+                      {showComponentDivider && <div style={{ height: '2px', backgroundColor: componentColors[unit.component], opacity: 0.5 }} />}
+                      <div style={{ display: 'flex', backgroundColor: idx % 2 === 0 ? '#0a0f1a' : '#0d1117' }}>
+                        <div style={{ width: LABEL_WIDTH, minWidth: LABEL_WIDTH, height: ROW_HEIGHT, padding: '4px 10px', display: 'flex', alignItems: 'center', borderRight: '1px solid #1e293b', borderBottom: '1px solid #0f172a', position: 'sticky', left: 0, backgroundColor: idx % 2 === 0 ? '#0a0f1a' : '#0d1117', zIndex: 10 }}>
+                          <div style={{ width: '5px', height: '5px', borderRadius: '50%', backgroundColor: componentColors[unit.component], marginRight: '6px' }} />
+                          <span style={{ fontSize: '9px', color: '#94a3b8', width: '44px' }}>{unit.mds}</span>
+                          <span onClick={() => !unit.theater && !READ_ONLY && setInventoryModal({ wing: unit.wing, mds: unit.mds })} style={{ fontSize: '9px', color: '#64748b', width: '70px', cursor: unit.theater || READ_ONLY ? 'default' : 'pointer' }}>{unit.wing}</span>
+                          <span onClick={() => !unit.theater && !READ_ONLY && setCrewModal({ id: unit.id, squadron: unit.squadron, wing: unit.wing })} style={{ fontSize: '10px', color: '#e2e8f0', width: '70px', cursor: unit.theater || READ_ONLY ? 'default' : 'pointer' }}>{unit.squadron}</span>
+                          {unit.associateType && <span style={{ fontSize: '7px', padding: '1px 3px', backgroundColor: unit.associateType === 'active' ? '#1e3a8a' : '#166534', borderRadius: '2px', color: unit.associateType === 'active' ? '#93c5fd' : '#86efac', marginRight: '4px' }}>{unit.associateType === 'active' ? 'AA' : 'CA'}</span>}
+                          <span style={{ fontSize: '9px', color: '#475569', marginLeft: 'auto' }}>{unit.base}</span>
+                        </div>
+                        <div style={{ flex: 1, height: ROW_HEIGHT, position: 'relative', borderBottom: '1px solid #0f172a', cursor: editMode && !isTheater && !READ_ONLY ? 'crosshair' : 'default' }} onClick={e => { if (e.target === e.currentTarget) handleTimelineClick(e, unit); }}>
+                          {MONTHS.map((month, i) => <div key={month.key} style={{ position: 'absolute', left: i * MONTH_WIDTH, width: MONTH_WIDTH, height: '100%', borderRight: month.isFYStart ? '2px solid #334155' : '1px solid #1e293b15', pointerEvents: 'none' }} />)}
+                          {!isTheater && showChanges && unitCommitments.filter(c => c.originalStartDate).map(c => { const style = getCommitmentStyle(c, true); return style ? <div key={`ghost-${c.id}`} style={{ position: 'absolute', top: '5px', height: ROW_HEIGHT - 10, borderRadius: '3px', pointerEvents: 'none', ...style }} /> : null; })}
+                          {!isTheater && unitCommitments.map(c => { 
+                            const style = getCommitmentStyle(c); 
+                            if (!style) return null; 
+                            const width = parseFloat(style.width) - 8; 
+                            const isDragging = dragState?.commitmentId === c.id; 
+                            return (
+                              <div key={c.id} 
+                                onMouseDown={e => !READ_ONLY && handleDragStart(e, c, unit)} 
+                                onClick={e => { e.stopPropagation(); if (!dragState && editMode && !READ_ONLY) setSelectedCommitment(c); }} 
+                                onDoubleClick={e => { e.stopPropagation(); if (!READ_ONLY) { setEditMode(true); setSelectedCommitment(c); } }} 
+                                onMouseEnter={e => handleMouseEnter(e, c)} 
+                                onMouseLeave={() => !dragState && setHoveredCommitment(null)} 
+                                style={{ position: 'absolute', top: '5px', height: ROW_HEIGHT - 10, borderRadius: '3px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '8px', fontWeight: 600, color: c.isConversion ? '#7f1d1d' : '#fff', cursor: editMode && !READ_ONLY ? (isDragging ? 'grabbing' : 'grab') : 'pointer', overflow: 'hidden', padding: '0 4px', boxShadow: selectedCommitment?.id === c.id ? '0 0 0 2px #fbbf24' : 'none', textShadow: c.isConversion ? 'none' : '0 1px 2px rgba(0,0,0,0.5)', opacity: isDragging ? 0.8 : 1, zIndex: isDragging ? 100 : 1, ...style }}>
+                                {getBlockLabel(c, width)}
+                              </div>
+                            ); 
+                          })}
+                        </div>
+                      </div>
+                    </React.Fragment>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Edit Panel */}
+            {editMode && selectedCommitment && !READ_ONLY && (
+              <div style={{ width: '280px', borderLeft: '1px solid #1e293b', padding: '10px', backgroundColor: '#0f172a', overflow: 'auto', maxHeight: 'calc(100vh - 280px)' }}>
+                <div style={{ fontSize: '10px', color: '#64748b', marginBottom: '8px', fontWeight: 600 }}>EDIT</div>
+                <select value={selectedCommitment.unitId} onChange={e => updateCommitment(selectedCommitment.id, { unitId: e.target.value })} style={{ width: '100%', marginBottom: '6px', padding: '5px', backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '4px', color: '#f8fafc', fontSize: '10px' }}>
+                  {units.filter(u => !u.theater).map(u => <option key={u.id} value={u.id}>{u.squadron} ({u.base})</option>)}
+                </select>
+                <div style={{ padding: '6px', backgroundColor: '#1e293b', borderRadius: '4px', marginBottom: '6px' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+                    <input type="checkbox" checked={selectedCommitment.isConversion} onChange={e => handleConversionToggle(e.target.checked)} style={{ accentColor: '#dc2626' }} />
+                    <span style={{ fontSize: '10px', color: '#f8fafc' }}>Conversion</span>
+                  </label>
+                </div>
+                <div style={{ display: 'flex', gap: '4px', marginBottom: '6px' }}>
+                  <div style={{ flex: 1 }}><label style={{ fontSize: '8px', color: '#64748b' }}>Start</label><input type="date" value={selectedCommitment.startDate || ''} onChange={e => { if (e.target.value) updateCommitment(selectedCommitment.id, { startDate: e.target.value }); }} style={{ width: '100%', padding: '4px', backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '4px', color: '#f8fafc', fontSize: '9px' }} /></div>
+                  <div style={{ flex: 1 }}><label style={{ fontSize: '8px', color: '#64748b' }}>End</label><input type="date" value={selectedCommitment.endDate || ''} onChange={e => { if (e.target.value) updateCommitment(selectedCommitment.id, { endDate: e.target.value }); }} style={{ width: '100%', padding: '4px', backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '4px', color: '#f8fafc', fontSize: '9px' }} /></div>
+                </div>
+                {!selectedCommitment.isConversion && (
+                  <>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}><span style={{ fontSize: '9px', color: '#64748b' }}>ALLOC</span><button onClick={addAllocation} style={{ padding: '2px 5px', backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '3px', color: '#94a3b8', cursor: 'pointer', fontSize: '9px' }}>+</button></div>
+                    {selectedCommitment.allocations.map((alloc, idx) => {
+                      const tc = getAllocationTailsCrews(alloc);
+                      const isCustom = alloc.customTails !== null;
+                      return (
+                        <div key={idx} style={{ padding: '5px', backgroundColor: '#1e293b', borderRadius: '4px', marginBottom: '4px' }}>
+                          <div style={{ display: 'flex', gap: '3px', marginBottom: '3px' }}>
+                            <select value={alloc.type} onChange={e => updateAllocation(idx, 'type', e.target.value)} style={{ flex: 1, padding: '3px', backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '3px', color: '#f8fafc', fontSize: '9px' }}>{Object.keys(commitmentTypes).map(t => <option key={t} value={t}>{t}</option>)}</select>
+                            <select value={alloc.location} onChange={e => updateAllocation(idx, 'location', e.target.value)} style={{ flex: 1, padding: '3px', backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '3px', color: '#f8fafc', fontSize: '9px' }}>{Object.keys(ccmdColors).map(l => <option key={l} value={l}>{l}</option>)}</select>
+                            {selectedCommitment.allocations.length > 1 && <button onClick={() => removeAllocation(idx)} style={{ padding: '2px 5px', backgroundColor: '#7f1d1d', border: 'none', borderRadius: '3px', color: '#fecaca', cursor: 'pointer', fontSize: '9px' }}>×</button>}
+                          </div>
+                          <div style={{ display: 'flex', gap: '3px' }}>
+                            <select value={alloc.package || ''} onChange={e => updateAllocation(idx, 'package', e.target.value || null)} disabled={isCustom} style={{ flex: 1, padding: '3px', backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '3px', color: isCustom ? '#64748b' : '#f8fafc', fontSize: '9px' }}><option value="">Cust</option>{Object.keys(packageTypes).map(p => <option key={p} value={p}>{p}</option>)}</select>
+                            <input type="number" min="0" max="24" value={isCustom ? alloc.customTails : ''} onChange={e => updateAllocation(idx, 'customTails', e.target.value)} placeholder={alloc.package ? packageTypes[alloc.package]?.tails : 'T'} style={{ width: '32px', padding: '3px', backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '3px', color: '#f8fafc', fontSize: '9px' }} />
+                            <input type="number" min="0" max="36" value={alloc.customCrews ?? ''} onChange={e => updateAllocation(idx, 'customCrews', e.target.value)} placeholder={tc.crews} style={{ width: '32px', padding: '3px', backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '3px', color: '#f8fafc', fontSize: '9px' }} />
+                          </div>
+                          <div style={{ marginTop: '2px', fontSize: '8px', color: '#64748b', textAlign: 'right' }}>{tc.tails}T/{tc.crews}C</div>
+                        </div>
+                      );
+                    })}
+                    <div style={{ padding: '4px', backgroundColor: '#1e293b', borderRadius: '3px', fontSize: '9px', color: '#94a3b8', display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}><span>Total:</span><span style={{ color: '#f8fafc', fontWeight: 600 }}>{getAllocationTotals(selectedCommitment.allocations).tails}T/{getAllocationTotals(selectedCommitment.allocations).crews}C</span></div>
+                  </>
+                )}
+                <button onClick={() => deleteCommitment(selectedCommitment.id)} style={{ width: '100%', padding: '5px', backgroundColor: '#7f1d1d', border: '1px solid #dc2626', borderRadius: '4px', color: '#fecaca', cursor: 'pointer', fontSize: '10px', fontWeight: 500 }}>DELETE</button>
+              </div>
+            )}
+          </div>
+
+          {/* Tooltip */}
+          {hoveredCommitment && !dragState && (
+            <div style={{ position: 'fixed', left: Math.min(tooltipPos.x, window.innerWidth - 260), top: tooltipPos.y, backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '6px', padding: '8px', zIndex: 1000, maxWidth: '240px', boxShadow: '0 4px 12px rgba(0,0,0,0.4)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                <span style={{ fontSize: '10px', fontWeight: 600, color: '#f8fafc' }}>{hoveredCommitment.isConversion ? 'CONVERSION' : hoveredCommitment.allocations.map(a => a.type).join('/')}</span>
+                <span style={{ fontSize: '9px', color: '#64748b' }}>{hoveredCommitment.startDate} → {hoveredCommitment.endDate}</span>
+              </div>
+              {!hoveredCommitment.isConversion && (
+                <div style={{ borderTop: '1px solid #334155', paddingTop: '4px' }}>
+                  {hoveredCommitment.allocations.map((a, i) => {
+                    const tc = getAllocationTailsCrews(a);
+                    return (
+                      <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '9px' }}>
+                        <div style={{ width: '5px', height: '5px', backgroundColor: ccmdColors[a.location], borderRadius: '2px' }} />
+                        <span style={{ color: '#94a3b8' }}>{a.type}</span>
+                        <span style={{ color: '#e2e8f0', flex: 1 }}>{a.location}</span>
+                        <span style={{ color: '#94a3b8' }}>{a.package || 'Cust'} ({tc.tails}T/{tc.crews}C)</span>
+                      </div>
+                    );
+                  })}
+                  <div style={{ borderTop: '1px solid #334155', paddingTop: '4px', marginTop: '4px', fontSize: '9px', display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: '#94a3b8' }}>Total:</span>
+                    <span style={{ color: '#f8fafc', fontWeight: 600 }}>{getAllocationTotals(hoveredCommitment.allocations).tails}T/{getAllocationTotals(hoveredCommitment.allocations).crews}C</span>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Inventory Modal */}
+          {inventoryModal && (
+            <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2000 }}>
+              <div style={{ backgroundColor: '#1e293b', border: '1px solid #475569', borderRadius: '8px', padding: '16px', maxWidth: '400px', width: '90%' }}>
+                <h3 style={{ margin: '0 0 12px 0', fontSize: '13px', color: '#f8fafc' }}>📊 Wing Inventory: {inventoryModal.wing}</h3>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '12px' }}>
+                  <div><label style={{ fontSize: '9px', color: '#64748b' }}>TAI</label><input type="number" min="0" value={wingInventory[inventoryModal.wing]?.tai || 0} onChange={e => updateWingInventory(inventoryModal.wing, 'tai', e.target.value)} style={{ width: '100%', padding: '6px', backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '4px', color: '#f8fafc', fontSize: '10px' }} /></div>
+                  <div><label style={{ fontSize: '9px', color: '#64748b' }}>BAI</label><input type="number" min="0" value={wingInventory[inventoryModal.wing]?.bai || 0} onChange={e => updateWingInventory(inventoryModal.wing, 'bai', e.target.value)} style={{ width: '100%', padding: '6px', backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '4px', color: '#f8fafc', fontSize: '10px' }} /></div>
+                  <div><label style={{ fontSize: '9px', color: '#64748b' }}>Depot</label><input type="number" min="0" value={wingInventory[inventoryModal.wing]?.depot || 0} onChange={e => updateWingInventory(inventoryModal.wing, 'depot', e.target.value)} style={{ width: '100%', padding: '6px', backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '4px', color: '#f8fafc', fontSize: '10px' }} /></div>
+                  <div style={{ backgroundColor: '#0f172a', padding: '6px', borderRadius: '4px' }}><div style={{ fontSize: '8px', color: '#64748b' }}>Calculated</div><div style={{ fontSize: '10px', color: '#f8fafc' }}>PAA: {getWingStats(inventoryModal.wing).paa}</div><div style={{ fontSize: '10px', color: '#22c55e' }}>Possessed: {getWingStats(inventoryModal.wing).possessed}</div></div>
+                </div>
+                {wingCrewTotals[inventoryModal.wing] && <div style={{ padding: '8px', backgroundColor: '#0f172a', borderRadius: '4px', marginBottom: '12px' }}><div style={{ fontSize: '9px', color: '#64748b' }}>Wing Crew Total: <span style={{ color: '#f8fafc', fontWeight: 600 }}>{wingCrewTotals[inventoryModal.wing].crews}</span></div></div>}
+                <div style={{ display: 'flex', justifyContent: 'flex-end' }}><button onClick={() => setInventoryModal(null)} style={{ padding: '6px 12px', backgroundColor: '#374151', border: '1px solid #4b5563', borderRadius: '4px', color: '#f8fafc', cursor: 'pointer', fontSize: '10px' }}>Close</button></div>
+              </div>
+            </div>
+          )}
+
+          {/* Crew Modal */}
+          {crewModal && (
+            <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2000 }}>
+              <div style={{ backgroundColor: '#1e293b', border: '1px solid #475569', borderRadius: '8px', padding: '16px', maxWidth: '320px', width: '90%' }}>
+                <h3 style={{ margin: '0 0 4px 0', fontSize: '13px', color: '#f8fafc' }}>👥 Squadron Crews</h3>
+                <p style={{ margin: '0 0 12px 0', fontSize: '10px', color: '#64748b' }}>{crewModal.squadron} • {crewModal.wing}</p>
+                <div style={{ marginBottom: '12px' }}><label style={{ fontSize: '9px', color: '#64748b' }}>Authorized Crews</label><input type="number" min="0" max="50" value={units.find(u => u.id === crewModal.id)?.crews || 0} onChange={e => updateSquadronCrews(crewModal.id, e.target.value)} style={{ width: '100%', padding: '6px', backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '4px', color: '#f8fafc', fontSize: '12px' }} /></div>
+                {wingCrewTotals[crewModal.wing] && <div style={{ padding: '8px', backgroundColor: '#0f172a', borderRadius: '4px', marginBottom: '12px' }}><div style={{ fontSize: '9px', color: '#64748b' }}>Wing Total: <span style={{ color: '#f8fafc', fontWeight: 600 }}>{wingCrewTotals[crewModal.wing].crews}</span></div></div>}
+                <div style={{ display: 'flex', justifyContent: 'flex-end' }}><button onClick={() => setCrewModal(null)} style={{ padding: '6px 12px', backgroundColor: '#374151', border: '1px solid #4b5563', borderRadius: '4px', color: '#f8fafc', cursor: 'pointer', fontSize: '10px' }}>Close</button></div>
+              </div>
+            </div>
+          )}
+
+          {/* Status Bar */}
+          <div style={{ padding: '6px 20px', borderTop: '1px solid #1e293b', backgroundColor: '#0f172a', display: 'flex', justifyContent: 'space-between', fontSize: '9px', color: '#64748b' }}>
+            <span>{visibleCommitments.length}{visibleCommitments.length !== commitments.length ? `/${commitments.length}` : ''} commits • {tdgEntries.length} TDG</span>
+            <span>{READ_ONLY ? 'View Only' : (editMode ? 'Drag • Click • DoubleClick' : 'View')} • {dateRange.start || dateRange.end ? `${dateRange.start || 'start'} → ${dateRange.end || 'end'}` : 'FY24-30'}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // App wrapper - loads data then renders
+    function App() {
+      const [data, setData] = useState(null);
+      const [error, setError] = useState(null);
+      const [loading, setLoading] = useState(true);
+
+      useEffect(() => {
+        fetch(DATA_URL)
+          .then(res => {
+            if (!res.ok) throw new Error(`Failed to load data: ${res.status}`);
+            return res.json();
+          })
+          .then(json => {
+            setData(json);
+            setLoading(false);
+          })
+          .catch(err => {
+            console.warn('Could not load data file, using defaults:', err);
+            setData(null);
+            setLoading(false);
+          });
+      }, []);
+
+      if (loading) return <div className="loading">Loading data...</div>;
+      if (error) return <div className="loading" style={{ color: '#ef4444' }}>Error: {error}</div>;
+
+      return <MobilityAllocationTool initialData={data} />;
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
